@@ -2,6 +2,13 @@ import os,sys,json,threading,time,urllib.request,urllib.error,base64,hashlib,zli
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from store import store,Repo,ZERO,USERS
 
+# Response caches. GET /api/v3/ responses are replayed verbatim until any
+# mutating request clears the cache, so a replayed body is never stale. The
+# auth model is a single shared token, so responses do not vary by caller.
+# Upload-pack responses are keyed by a repo fingerprint (object count + refs)
+# plus the request body hash, so any push or ref change misses naturally.
+_GET_CACHE={}
+_UP_CACHE={}
 def pkt(data=b''): return f'{len(data)+4:04x}'.encode()+data
 def flush():return b'0000'
 def unpkt(b):
@@ -180,6 +187,9 @@ class H(BaseHTTPRequestHandler):
   if headers:
    for k,v in headers.items():head+=f'{k}: {v}\r\n'.encode()
   self.wfile.write(head+b'\r\n'+b)
+  if self.command=='GET' and status==200 and self.path.startswith('/api/v3/') and len(b)<200000 and self.path not in _GET_CACHE:
+   if len(_GET_CACHE)>=512:_GET_CACHE.clear()
+   _GET_CACHE[self.path]=(ctype,b,headers)
  def auth(self):return self.headers.get('Authorization')==_token()
  def do_GET(self):self.route()
  def do_POST(self):self.route()
@@ -191,10 +201,14 @@ class H(BaseHTTPRequestHandler):
    if hasattr(self,'_body_cache'):del self._body_cache
    if self.command in ('POST','PUT','PATCH','DELETE'):self.body()
    rawpath,sep,query=self.path.partition('?'); path=urllib.parse.unquote(rawpath); q=urllib.parse.parse_qs(query) if sep else {}; method=self.command
+   if method!='GET':_GET_CACHE.clear()
    if path=='/healthz':return self.send(200,{'ok':True})
    if path.startswith('/api/') or path=='/mcp':
     if not self.auth():
      self.body();return self.send(401,{'message':'Bad credentials'})
+   if method=='GET' and path.startswith('/api/v3/'):
+    hit=_GET_CACHE.get(self.path)
+    if hit is not None:return self.send(200,None,hit[0],raw=hit[1],headers=hit[2])
    if path=='/mcp':return self.mcp()
    if path=='/api/graphql':return self.graphql()
    if path.startswith('/api/v3/'):return self.rest(path[7:],q)
@@ -237,6 +251,9 @@ class H(BaseHTTPRequestHandler):
       out+=pkt((line+'\n').encode())
     return self.send(200,None,'application/x-git-upload-pack-result',raw=out+flush())
    if packets and isinstance(packets[0],bytes) and packets[0].startswith(b'command=fetch'):
+    ck=((len(r.objects),tuple(sorted(r.refs.items()))),hashlib.sha1(body).digest())
+    resp=_UP_CACHE.get(ck)
+    if resp is not None:return self.send(200,None,'application/x-git-upload-pack-result',raw=resp)
     args=[x.decode(errors='ignore').strip() for x in packets if isinstance(x,bytes)]
     wants=[x[5:] for x in args if x.startswith('want ')]; haves=[x[5:] for x in args if x.startswith('have ')]
     boundaries=[x[8:] for x in args if x.startswith('shallow ')]; depth=next((int(x[7:]) for x in args if x.startswith('deepen ')),None)
@@ -287,11 +304,20 @@ class H(BaseHTTPRequestHandler):
     for oid in new_boundaries:out+=pkt(('shallow '+oid+'\n').encode())
     out+=flush()+pkt(b'wanted-refs\n')+flush()+pkt(b'packfile\n')
     for i in range(0,len(pack),65515):out+=pkt(b'\x01'+pack[i:i+65515])
-    return self.send(200,None,'application/x-git-upload-pack-result',raw=out+flush())
+    resp=out+flush()
+    if len(_UP_CACHE)>=64:_UP_CACHE.clear()
+    _UP_CACHE[ck]=resp
+    return self.send(200,None,'application/x-git-upload-pack-result',raw=resp)
    wants=[x.decode(errors='ignore').split(' ',2)[1].split('\0')[0].strip() for x in packets if isinstance(x,bytes) and x.startswith(b'want ')]
-   pack=makepack(r,wants) if wants else b''
-   framed=pkt(b'\x01'+pack) if pack else b''
-   return self.send(200,None,'application/x-git-upload-pack-result',raw=pkt(b'NAK\n')+framed+flush())
+   ck=((len(r.objects),tuple(sorted(r.refs.items()))),hashlib.sha1(body).digest())
+   resp=_UP_CACHE.get(ck)
+   if resp is None:
+    pack=makepack(r,wants) if wants else b''
+    framed=pkt(b'\x01'+pack) if pack else b''
+    resp=pkt(b'NAK\n')+framed+flush()
+    if len(_UP_CACHE)>=64:_UP_CACHE.clear()
+    _UP_CACHE[ck]=resp
+   return self.send(200,None,'application/x-git-upload-pack-result',raw=resp)
    return self.send(200,None,'application/x-git-upload-pack-result',raw=pkt(b'NAK\n')+flush())
   # receive-pack v0 command section followed by pack
   parsed,split=unpkt(body); packdata=body[split:]
