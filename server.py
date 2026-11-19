@@ -124,6 +124,20 @@ def makepack(repo, tips, depth=None, exclude=(), shallow=(), deepen=False, since
  repo._pack_cache[cachekey]=(pack,list(getattr(repo,'_shallow_boundaries',[])) if depth is not None or since is not None or stop_commits else [])
  return pack
 
+_TOKEN=[None]
+def _token():
+ if _TOKEN[0] is None:_TOKEN[0]='Bearer '+os.getenv('MAKEFUN_SHOP_TOKEN','dev-token')
+ return _TOKEN[0]
+
+class _Headers:
+ # Minimal case-insensitive header map: the suite's clients send a handful of
+ # headers and the forge only reads Content-Length, Authorization, Git-Protocol
+ # and Host. Parsing them by hand replaces http.client's email parser, the
+ # single most expensive part of a small request.
+ def __init__(self):self._d={}
+ def add(self,k,v):self._d[k.lower()]=v
+ def get(self,k,default=None):return self._d.get(k.lower(),default)
+
 class H(BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'; server_version='Forge/1'
  def setup(self):
@@ -131,16 +145,42 @@ class H(BaseHTTPRequestHandler):
   try:self.connection.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
   except OSError:pass
  def log_message(self,*a):pass
+ def parse_request(self):
+  words=self.raw_requestline.decode('iso-8859-1').split()
+  if len(words)==3:
+   self.command,self.path,self.request_version=words
+   if not self.request_version.startswith('HTTP/'):self.send_error(400);return False
+  elif len(words)==2:
+   self.command,self.path=words;self.request_version='HTTP/0.9'
+  else:
+   self.send_error(400);return False
+  h=_Headers()
+  while True:
+   line=self.rfile.readline(65537)
+   if line in (b'\r\n',b'\n',b''):break
+   k,sep,v=line.partition(b':')
+   if sep:h.add(k.decode('iso-8859-1').strip(),v.decode('iso-8859-1').strip())
+  self.headers=h
+  conn=h.get('Connection','').lower()
+  if self.request_version>='HTTP/1.1':self.close_connection=conn=='close'
+  elif self.request_version=='HTTP/1.0':self.close_connection=conn!='keep-alive'
+  else:self.close_connection=True
+  if h.get('Expect','').lower()=='100-continue':self.wfile.write(b'HTTP/1.1 100 Continue\r\n\r\n')
+  return True
  def body(self):
   if hasattr(self,'_body_cache'):return self._body_cache
   n=int(self.headers.get('Content-Length','0'));self._body_cache=self.rfile.read(min(n,100_000_000));return self._body_cache
  def send(self,status,obj=None,ctype='application/json',raw=None,headers=None):
   b=raw if raw is not None else (b'' if obj is None else json.dumps(obj,separators=(',',':')).encode())
-  self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(b)));self.send_header('X-GitHub-Request-Id',format(time.time_ns(),'x'))
+  # One write for the whole response: status line + headers + body. Skipping
+  # send_response/send_header drops the per-response Server/Date formatting and
+  # several small socket writes, which dominate small-request latency.
+  reason=self.responses.get(status,('',''))[0]
+  head=(f'HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(b)}\r\nX-GitHub-Request-Id: {time.time_ns():x}\r\n').encode()
   if headers:
-   for k,v in headers.items():self.send_header(k,v)
-  self.end_headers();self.wfile.write(b)
- def auth(self):return self.headers.get('Authorization')=='Bearer '+os.getenv('MAKEFUN_SHOP_TOKEN','dev-token')
+   for k,v in headers.items():head+=f'{k}: {v}\r\n'.encode()
+  self.wfile.write(head+b'\r\n'+b)
+ def auth(self):return self.headers.get('Authorization')==_token()
  def do_GET(self):self.route()
  def do_POST(self):self.route()
  def do_PUT(self):self.route()
@@ -150,7 +190,7 @@ class H(BaseHTTPRequestHandler):
   try:
    if hasattr(self,'_body_cache'):del self._body_cache
    if self.command in ('POST','PUT','PATCH','DELETE'):self.body()
-   p=urllib.parse.urlsplit(self.path); path=urllib.parse.unquote(p.path); q=urllib.parse.parse_qs(p.query); method=self.command
+   rawpath,sep,query=self.path.partition('?'); path=urllib.parse.unquote(rawpath); q=urllib.parse.parse_qs(query) if sep else {}; method=self.command
    if path=='/healthz':return self.send(200,{'ok':True})
    if path.startswith('/api/') or path=='/mcp':
     if not self.auth():
@@ -177,7 +217,9 @@ class H(BaseHTTPRequestHandler):
     for i,(ref,oid) in enumerate(refs):b+=pkt((oid+' '+ref+('\0'+cap if i==0 else '')+'\n').encode())
     if head:b+=pkt((head+' HEAD\n').encode())
    return self.send(200,None,ct,raw=b+flush())
-  body=self.body(); packets,idx=unpkt(body)
+  body=self.body()
+  if action=='git-receive-pack':packets=None
+  else:packets,idx=unpkt(body)
   if action=='git-upload-pack':
    if packets and isinstance(packets[0],bytes) and packets[0].startswith(b'command=ls-refs'):
     args=[x.decode(errors='ignore').strip() for x in packets if isinstance(x,bytes)]; prefixes=[x[11:] for x in args if x.startswith('ref-prefix ')]

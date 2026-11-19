@@ -50,14 +50,15 @@ class Repo:
     todo.extend(self.parents(c))
 
 class Store:
- def __init__(self): self.repos={}; self.nextid=1; self.nextissue=1; self.nextpull=1; self.nextcomment=1; self.clock=0
+ def __init__(self): self.repos={}; self.nextid=1; self.nextissue=1; self.nextpull=1; self.nextcomment=1; self.clock=0; self._base=None
  def now(self):
   raw=os.getenv('MAKEFUN_TRIAL_NOW');
   if raw:
-   import datetime
-   try: base=datetime.datetime.fromisoformat(raw.replace('Z','+00:00')).timestamp()
-   except: base=1700000000
-   self.clock+=1; return time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(base+self.clock))
+   if self._base is None:
+    import datetime
+    try: self._base=datetime.datetime.fromisoformat(raw.replace('Z','+00:00')).timestamp()
+    except: self._base=1700000000
+   self.clock+=1; return time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(self._base+self.clock))
   return time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
  def create(self,o,n):
   if (o,n) in self.repos:return self.repos[o,n]
