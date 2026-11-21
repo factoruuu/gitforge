@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/github-core-clone-01/factoruuu/gitforge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/factoruuu/gitforge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A GitHub-compatible git forge in a single Python 3 program, standard library only — no pip packages, no external git binary. One process serves, from one shared in-memory store:
+A GitHub-compatible git forge written in Go (standard library only), compiled to one statically linked Linux amd64 binary — no external git binary, no third-party packages. One process serves, from one shared in-memory store:
 
 - **Git smart HTTP** — upload-pack protocol v2 (fetch + ls-refs, shallow clones, incremental fetch) and v0, receive-pack v0 with sideband report-status, per-ref non-fast-forward refusal, full pack reading (ofs/ref deltas) and writing, annotated tags, branch/tag deletion.
 - **REST API** under `/api/v3` — repositories, contents (create/update/delete with sha checks), git refs/trees/commits, branches, labels, issues + comments, pull requests with file diffs and squash merges (real 3-way tree merges that land as commits on the default branch).
@@ -13,7 +13,9 @@ A GitHub-compatible git forge in a single Python 3 program, standard library onl
 
 Auth is a single bearer token; the token's owner is the viewer. Storage is in-memory and deterministic (sequential ids, `MAKEFUN_TRIAL_NOW` pins timestamps).
 
-Architecture: `main.py` puts its own directory on `sys.path` before importing the server (it runs as `python3 -P -s main.py`). `server.py` owns HTTP routing and the git/REST/GraphQL/MCP protocol handling; `store.py` holds repository, object, ref, issue and pull-request state. `demo.py` is an end-to-end proof with the real git CLI: it starts the forge, creates a repo over REST, pushes a commit, clones it back and verifies the file contents.
+## How it runs
+
+The entry point is still `python3 main.py`. The forge binary travels through git as base85 text (`forge.b85.00`, `forge.b85.01`, …) because git hosts store text far more happily than a 6 MB binary; `main.py` joins and decodes the parts into `/tmp`, marks the result executable and `exec`s it — same process, same environment, same stdio. The Go sources live in `src/` (`main.go` HTTP/routing, `githttp.go` + `git.go` the git protocol, `rest.go`, `gql.go`, `mcp.go`, `store.go` state, `json.go` value model) and rebuild with `build-forge.sh` (Go 1.23+, `CGO_ENABLED=0`, `-ldflags="-s -w"`).
 
 ## Run it
 
